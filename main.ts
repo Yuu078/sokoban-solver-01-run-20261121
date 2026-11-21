@@ -52,7 +52,10 @@ class BudgetOut extends Error {}
 
 /** A level in XSB text (# wall, space floor, . goal, $ box, * box on a goal, @ player, + player on a goal). */
 function parseLevel(text: string): Level {
-  const rows = text.split('\n').filter((r) => r.length > 0);
+  const rows = text
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((r) => /[#$.*@+]/.test(r));
   const h = rows.length;
   const w = Math.max(...rows.map((r) => r.length));
   const wall = new Uint8Array(w * h).fill(1);
@@ -129,43 +132,84 @@ function goalDistances(level: Level): number[][] {
 }
 
 /**
- * Cheapest assignment of boxes to goals by floor distance. Exact by
- * permutation for small rooms; for larger sets the sum of each box's nearest
- * goal, still admissible (one push cuts either sum by at most one).
+ * Cheapest assignment of boxes to goals by floor distance: the exact
+ * minimum-cost bipartite matching (Hungarian, O(n^3)) for every box count.
+ * Admissible: one push moves one box one square, so it cuts the true
+ * remaining pushes by at most one, and the optimal matching can only
+ * follow. Unreachable box-goal pairs enter the matching as a large finite
+ * sentinel; a matching forced to use one reads back as infinite, since
+ * some box then has no reachable goal at all.
  */
 function assignmentEstimate(boxes: number[], dist: number[][], goals: number[]): number {
   const n = boxes.length;
   if (n === 0) return 0;
-  if (n > 6) {
-    let s = 0;
-    for (const b of boxes) {
-      let m = Infinity;
-      for (let g = 0; g < goals.length; g++) m = Math.min(m, dist[g]![b]!);
-      if (m === Infinity) return Infinity;
-      s += m;
+  const m = goals.length;
+  if (n > m) return Infinity;
+  const SENTINEL = 1_000_000_000;
+  // cost[i][j], 1-based: floor distance from box i to goal j.
+  const cost: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      const d = dist[j - 1]![boxes[i - 1]!]!;
+      cost[i]![j] = d === Infinity ? SENTINEL : d;
     }
-    return s;
   }
-  // Exact minimum over the matchings, by walking the permutations.
-  const used = new Array<boolean>(goals.length).fill(false);
-  let best = Infinity;
-  const walk = (bi: number, acc: number): void => {
-    if (acc >= best) return;
-    if (bi === n) {
-      best = acc;
-      return;
-    }
-    for (let g = 0; g < goals.length; g++) {
-      if (used[g]) continue;
-      const d = dist[g]![boxes[bi]!]!;
-      if (d === Infinity) continue;
-      used[g] = true;
-      walk(bi + 1, acc + d);
-      used[g] = false;
-    }
-  };
-  walk(0, 0);
-  return best;
+  // Hungarian algorithm, potentials form: u and v are the potentials, p[j]
+  // the box matched to goal j (0 = free), way[] the augmenting path.
+  // Deterministic: every tie breaks by lowest index.
+  const u = new Array<number>(n + 1).fill(0);
+  const v = new Array<number>(m + 1).fill(0);
+  const p = new Array<number>(m + 1).fill(0);
+  const way = new Array<number>(m + 1).fill(0);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array<number>(m + 1).fill(Infinity);
+    const used = new Array<boolean>(m + 1).fill(false);
+    do {
+      used[j0] = true;
+      const i0 = p[j0]!;
+      let delta = Infinity;
+      let j1 = -1;
+      for (let j = 1; j <= m; j++) {
+        if (used[j]) continue;
+        const cur = cost[i0]![j]! - u[i0]! - v[j]!;
+        if (cur < minv[j]!) {
+          minv[j] = cur;
+          way[j] = j0;
+        }
+        if (minv[j]! < delta) {
+          delta = minv[j]!;
+          j1 = j;
+        }
+      }
+      for (let j = 0; j <= m; j++) {
+        if (used[j]) {
+          u[p[j]!] = u[p[j]!]! + delta;
+          v[j] = v[j]! - delta;
+        } else {
+          minv[j] = minv[j]! - delta;
+        }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do {
+      const j1 = way[j0]!;
+      p[j0] = p[j1]!;
+      j0 = j1;
+    } while (j0 !== 0);
+  }
+  // Read the matching back in true distances: a sentinel edge means the
+  // estimate is infinite.
+  const goalOf = new Array<number>(n + 1).fill(0);
+  for (let j = 1; j <= m; j++) if (p[j] !== 0) goalOf[p[j]!] = j;
+  let total = 0;
+  for (let i = 1; i <= n; i++) {
+    const d = dist[goalOf[i]! - 1]![boxes[i - 1]!]!;
+    if (d === Infinity) return Infinity;
+    total += d;
+  }
+  return total;
 }
 
 /** The squares the player reaches from `from` with `occupied` in the way; returns the lowest square reached. */
@@ -243,7 +287,9 @@ interface Solved {
  * Push-optimal search over one board: A* when `astar` (heuristic on), plain
  * push-BFS when off (f = pushes, heap order by insertion). A state is the
  * boxes' squares plus the player's reachable region, named by its lowest
- * square. Returns null when the state cap runs out or the board is unsolved.
+ * square. Returns null when this search's own state cap runs out (capped:
+ * the caller may fall back) or the board is unsolved. BudgetOut is thrown
+ * only when the shared instance budget is spent: that ends the instance.
  */
 function solvePush(level: Level, maxStates: number, astar: boolean, budget: Budget): Solved | null {
   const { w, wall, goals } = level;
@@ -317,7 +363,7 @@ function solvePush(level: Level, maxStates: number, astar: boolean, budget: Budg
   };
   heapPush(0);
 
-  let found = solved(level.boxes) ? 0 : -1;
+  let found = -1;
   while (heap.length > 0 && found < 0) {
     const s = heapPop();
     const boxes = sBoxes[s]!;
@@ -329,6 +375,12 @@ function solvePush(level: Level, maxStates: number, astar: boolean, budget: Budg
     if (best.get(keyOf(boxes, low)) !== sG[s]) {
       for (const b of boxes) occupied[b] = 0;
       continue;
+    }
+    // Goal test at pop time: the first solved state off the heap is optimal.
+    if (solved(boxes)) {
+      found = s;
+      for (const b of boxes) occupied[b] = 0;
+      break;
     }
     for (let bi = 0; bi < boxes.length && found < 0; bi++) {
       const b = boxes[bi]!;
@@ -356,9 +408,13 @@ function solvePush(level: Level, maxStates: number, astar: boolean, budget: Budg
         if (h === Infinity) continue;
         const prevG = best.get(key);
         if (prevG !== undefined && prevG <= sG[s]! + 1) continue;
-        if (budget.used >= budget.limit || sBoxes.length >= maxStates) {
+        if (budget.used >= budget.limit) {
           for (const x of boxes) occupied[x] = 0;
           throw new BudgetOut();
+        }
+        if (sBoxes.length >= maxStates) {
+          for (const x of boxes) occupied[x] = 0;
+          return null;
         }
         budget.used++;
         const ns = sBoxes.length;
@@ -372,10 +428,6 @@ function solvePush(level: Level, maxStates: number, astar: boolean, budget: Budg
         sH.push(h);
         sOnGoal.push(next.filter((x) => goal[x]).length);
         heapPush(ns);
-        if (solved(next)) {
-          found = ns;
-          break;
-        }
       }
     }
     for (const b of boxes) occupied[b] = 0;
@@ -414,7 +466,8 @@ interface Room {
  * The level's rooms: cut the dead squares of the player's row (the hallway:
  * a box there reaches no goal) out of the floor, and each part left that
  * holds a box is a room. Null when some part holds more or fewer boxes than
- * goals, or a box starts in the hallway: then the level is no set of rooms.
+ * goals, a box starts in the hallway, or some part holds more than 4 boxes
+ * (two rooms the cut failed to separate): then the level is no set of rooms.
  */
 function roomsOf(level: Level): Room[] | null {
   const { w, wall, goals, boxes, player } = level;
@@ -442,17 +495,26 @@ function roomsOf(level: Level): Room[] | null {
   }
   for (const b of boxes) rooms[part[b]!]!.boxes.push(b);
   for (const g of goals) if (part[g]! >= 0) rooms[part[g]!]!.goals.push(g);
+  if (rooms.some((r) => r.boxes.length > 4)) return null;
   if (goals.some((g) => part[g]! < 0) || rooms.some((r) => r.boxes.length !== r.goals.length)) return null;
   return rooms.filter((r) => r.boxes.length > 0);
 }
 
-/** The level solved room by room, the other rooms' boxes standing as walls; the whole board when it is no set of rooms. */
+/**
+ * The level solved room by room, the other rooms' boxes standing as walls.
+ * The whole board is the fallback: when the level is no set of rooms, and
+ * when a room's searches come back capped or unsolved — '' only when the
+ * whole board fails too, or the shared budget runs out mid-search.
+ */
 function solveLevel(level: Level, budget: Budget): string {
+  const wholeBoard = (): string => {
+    const whole = solvePush(level, ASTAR_STATES, true, budget) ?? solvePush(level, BFS_STATES, false, budget);
+    return whole === null ? '' : whole.moves;
+  };
   const rooms = roomsOf(level);
   if (rooms === null) {
     try {
-      const whole = solvePush(level, ASTAR_STATES, true, budget) ?? solvePush(level, BFS_STATES, false, budget);
-      return whole === null ? '' : whole.moves;
+      return wholeBoard();
     } catch (e) {
       if (e instanceof BudgetOut) return '';
       throw e;
@@ -481,7 +543,14 @@ function solveLevel(level: Level, budget: Budget): string {
       if (e instanceof BudgetOut) return '';
       throw e;
     }
-    if (solved === null) return '';
+    if (solved === null) {
+      try {
+        return wholeBoard();
+      } catch (e) {
+        if (e instanceof BudgetOut) return '';
+        throw e;
+      }
+    }
     moves += solved.moves;
     player = endOf(level.w, player, solved.moves);
     room.done = true;
